@@ -90,22 +90,28 @@ func (r *registry) root(resp http.ResponseWriter, req *http.Request) {
 // New returns a handler which implements the docker registry protocol.
 // It should be registered at the site root.
 func New(opts ...Option) http.Handler {
-	r := &registry{
-		log: log.New(os.Stderr, "", log.LstdFlags),
-		blobs: blobs{
-			blobHandler: &memHandler{m: map[string][]byte{}},
-			uploads:     map[string][]byte{},
-			log:         log.New(os.Stderr, "", log.LstdFlags),
-		},
-		manifests: manifests{
-			manifests: map[string]map[string]manifest{},
-			log:       log.New(os.Stderr, "", log.LstdFlags),
-		},
+	if store, err := NewSQLiteManifestStore("registry.sqlite"); err != nil {
+		log.Fatalf("Error: %v", err)
+	} else {
+		r := &registry{
+			log: log.New(os.Stderr, "", log.LstdFlags),
+			blobs: blobs{
+				blobHandler: &memHandler{m: map[string][]byte{}},
+				uploads:     map[string][]byte{},
+				log:         log.New(os.Stderr, "", log.LstdFlags),
+			},
+			manifests: manifests{
+				store: store,
+				log:   log.New(os.Stderr, "", log.LstdFlags),
+			},
+		}
+		for _, o := range opts {
+			o(r)
+		}
+		return http.HandlerFunc(r.root)
 	}
-	for _, o := range opts {
-		o(r)
-	}
-	return http.HandlerFunc(r.root)
+
+	return nil
 }
 
 // Option describes the available options
@@ -140,5 +146,11 @@ func WithWarning(prob float64, msg string) Option {
 func WithBlobHandler(h BlobHandler) Option {
 	return func(r *registry) {
 		r.blobs.blobHandler = h
+	}
+}
+
+func WithManifestStore(m ManifestStore) Option {
+	return func(r *registry) {
+		r.manifests.store = m
 	}
 }

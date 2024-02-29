@@ -24,11 +24,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 )
+
+type ManifestStore interface {
+	Get(repo string, target string) (*manifest, error)
+	ManifestsForRepository(repo string) (map[string]manifest, bool)
+	Put(repo string, target string, m manifest) error
+	Delete(repo string, target string) error
+	GetTags(repo string) ([]string, error)
+	Exists(repo string, target string) bool
+	ListRepositories() []string
+}
 
 type catalog struct {
 	Repos []string `json:"repositories"`
@@ -46,9 +55,8 @@ type manifest struct {
 
 type manifests struct {
 	// maps repo -> manifest tag/digest -> manifest
-	manifests map[string]map[string]manifest
-	lock      sync.RWMutex
-	log       *log.Logger
+	log   *log.Logger
+	store ManifestStore
 }
 
 func isManifest(req *http.Request) bool {
@@ -99,19 +107,8 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 
 	switch req.Method {
 	case http.MethodGet:
-		m.lock.RLock()
-		defer m.lock.RUnlock()
-
-		c, ok := m.manifests[repo]
-		if !ok {
-			return &regError{
-				Status:  http.StatusNotFound,
-				Code:    "NAME_UNKNOWN",
-				Message: "Unknown name",
-			}
-		}
-		m, ok := c[target]
-		if !ok {
+		m, err := m.store.Get(repo, target)
+		if err != nil {
 			return &regError{
 				Status:  http.StatusNotFound,
 				Code:    "MANIFEST_UNKNOWN",
@@ -128,31 +125,21 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		return nil
 
 	case http.MethodHead:
-		m.lock.RLock()
-		defer m.lock.RUnlock()
 
-		if _, ok := m.manifests[repo]; !ok {
+		if m, err := m.store.Get(repo, target); err != nil {
 			return &regError{
 				Status:  http.StatusNotFound,
 				Code:    "NAME_UNKNOWN",
 				Message: "Unknown name",
 			}
+		} else {
+			h, _, _ := v1.SHA256(bytes.NewReader(m.blob))
+			resp.Header().Set("Docker-Content-Digest", h.String())
+			resp.Header().Set("Content-Type", m.contentType)
+			resp.Header().Set("Content-Length", fmt.Sprint(len(m.blob)))
+			resp.WriteHeader(http.StatusOK)
+			return nil
 		}
-		m, ok := m.manifests[repo][target]
-		if !ok {
-			return &regError{
-				Status:  http.StatusNotFound,
-				Code:    "MANIFEST_UNKNOWN",
-				Message: "Unknown manifest",
-			}
-		}
-
-		h, _, _ := v1.SHA256(bytes.NewReader(m.blob))
-		resp.Header().Set("Docker-Content-Digest", h.String())
-		resp.Header().Set("Content-Type", m.contentType)
-		resp.Header().Set("Content-Length", fmt.Sprint(len(m.blob)))
-		resp.WriteHeader(http.StatusOK)
-		return nil
 
 	case http.MethodPut:
 		b := &bytes.Buffer{}
@@ -170,8 +157,6 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		// registries require this.
 		if types.MediaType(mf.contentType).IsIndex() {
 			if err := func() *regError {
-				m.lock.RLock()
-				defer m.lock.RUnlock()
 
 				im, err := v1.ParseIndexManifest(b)
 				if err != nil {
@@ -186,7 +171,7 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 						continue
 					}
 					if desc.MediaType.IsIndex() || desc.MediaType.IsImage() {
-						if _, found := m.manifests[repo][desc.Digest.String()]; !found {
+						if !m.store.Exists(repo, desc.Digest.String()) {
 							return &regError{
 								Status:  http.StatusNotFound,
 								Code:    "MANIFEST_UNKNOWN",
@@ -204,42 +189,32 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 			}
 		}
 
-		m.lock.Lock()
-		defer m.lock.Unlock()
+		// Store by digest and tag.
+		m.store.Put(repo, digest, mf)
+		m.store.Put(repo, target, mf)
 
-		if _, ok := m.manifests[repo]; !ok {
-			m.manifests[repo] = make(map[string]manifest, 2)
-		}
-
-		// Allow future references by target (tag) and immutable digest.
-		// See https://docs.docker.com/engine/reference/commandline/pull/#pull-an-image-by-digest-immutable-identifier.
-		m.manifests[repo][digest] = mf
-		m.manifests[repo][target] = mf
 		resp.Header().Set("Docker-Content-Digest", digest)
 		resp.WriteHeader(http.StatusCreated)
 		return nil
 
 	case http.MethodDelete:
-		m.lock.Lock()
-		defer m.lock.Unlock()
-		if _, ok := m.manifests[repo]; !ok {
-			return &regError{
-				Status:  http.StatusNotFound,
-				Code:    "NAME_UNKNOWN",
-				Message: "Unknown name",
-			}
-		}
 
-		_, ok := m.manifests[repo][target]
-		if !ok {
+		if !m.store.Exists(repo, target) {
 			return &regError{
 				Status:  http.StatusNotFound,
 				Code:    "MANIFEST_UNKNOWN",
 				Message: "Unknown manifest",
 			}
+		} else {
+			if err := m.store.Delete(repo, target); err != nil {
+				return &regError{
+					Status:  http.StatusInternalServerError,
+					Code:    "MANIFEST_DELETE_FAILED",
+					Message: fmt.Sprintf("Failed to delete manifest: %v", err),
+				}
+			}
 		}
 
-		delete(m.manifests[repo], target)
 		resp.WriteHeader(http.StatusAccepted)
 		return nil
 
@@ -258,11 +233,10 @@ func (m *manifests) handleTags(resp http.ResponseWriter, req *http.Request) *reg
 	repo := strings.Join(elem[1:len(elem)-2], "/")
 
 	if req.Method == "GET" {
-		m.lock.RLock()
-		defer m.lock.RUnlock()
 
-		c, ok := m.manifests[repo]
-		if !ok {
+		c, err := m.store.GetTags(repo)
+
+		if err != nil {
 			return &regError{
 				Status:  http.StatusNotFound,
 				Code:    "NAME_UNKNOWN",
@@ -271,7 +245,7 @@ func (m *manifests) handleTags(resp http.ResponseWriter, req *http.Request) *reg
 		}
 
 		var tags []string
-		for tag := range c {
+		for _, tag := range c {
 			if !strings.Contains(tag, "sha256:") {
 				tags = append(tags, tag)
 			}
@@ -330,13 +304,11 @@ func (m *manifests) handleCatalog(resp http.ResponseWriter, req *http.Request) *
 	}
 
 	if req.Method == "GET" {
-		m.lock.RLock()
-		defer m.lock.RUnlock()
 
 		var repos []string
 		countRepos := 0
 		// TODO: implement pagination
-		for key := range m.manifests {
+		for _, key := range m.store.ListRepositories() {
 			if countRepos >= n {
 				break
 			}
@@ -388,10 +360,7 @@ func (m *manifests) handleReferrers(resp http.ResponseWriter, req *http.Request)
 		}
 	}
 
-	m.lock.RLock()
-	defer m.lock.RUnlock()
-
-	digestToManifestMap, repoExists := m.manifests[repo]
+	digestToManifestMap, repoExists := m.store.ManifestsForRepository(repo)
 	if !repoExists {
 		return &regError{
 			Status:  http.StatusNotFound,
