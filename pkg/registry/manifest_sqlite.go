@@ -16,20 +16,6 @@ type SQLiteManifestStore struct {
 	db   *gorm.DB
 }
 
-type Manifest struct {
-	Repository string `json:"repository"`
-	Target     string `json:"target"`
-	MediaType  string `json:"mediaType"`
-	Blob       []byte `json:"blob"`
-}
-
-func (m *Manifest) toManifest() manifest {
-	return manifest{
-		contentType: m.MediaType,
-		blob:        m.Blob,
-	}
-}
-
 func NewSQLiteManifestStore(dbname string) (*SQLiteManifestStore, error) {
 	ctx := context.Background()
 
@@ -46,7 +32,7 @@ func NewSQLiteManifestStore(dbname string) (*SQLiteManifestStore, error) {
 	}
 }
 
-func (m *SQLiteManifestStore) Get(repo string, target string) (*manifest, error) {
+func (m *SQLiteManifestStore) Get(repo string, target string) (*Manifest, error) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
@@ -54,23 +40,15 @@ func (m *SQLiteManifestStore) Get(repo string, target string) (*manifest, error)
 	if err := m.db.Where("repository = ? AND target = ?", repo, target).First(&manifest).Error; err != nil {
 		return nil, fmt.Errorf("manifest not found")
 	}
-	mf := manifest.toManifest()
 
-	return &mf, nil
+	return &manifest, nil
 }
 
-func (m *SQLiteManifestStore) Put(repo string, target string, mf manifest) error {
+func (m *SQLiteManifestStore) Put(mf Manifest) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
-	manifest := Manifest{
-		Repository: repo,
-		Target:     target,
-		MediaType:  mf.contentType,
-		Blob:       mf.blob,
-	}
-
-	if err := m.db.Create(&manifest).Error; err != nil {
+	if err := m.db.Create(&mf).Error; err != nil {
 		return fmt.Errorf("error creating manifest: %v", err)
 	}
 
@@ -126,7 +104,7 @@ func (m *SQLiteManifestStore) ListRepositories() []string {
 	}
 }
 
-func (m *SQLiteManifestStore) ManifestsForRepository(repo string) (map[string]manifest, bool) {
+func (m *SQLiteManifestStore) ManifestsForRepository(repo string) ([]Manifest, bool) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
@@ -134,11 +112,7 @@ func (m *SQLiteManifestStore) ManifestsForRepository(repo string) (map[string]ma
 	if err := m.db.Where("repository = ?", repo).Find(&repoManifests).Error; err != nil {
 		return nil, false
 	} else {
-		manifests := make(map[string]manifest, len(repoManifests))
-		for _, m := range repoManifests {
-			manifests[m.Target] = m.toManifest()
-		}
-		return manifests, true
+		return repoManifests, true
 	}
 }
 

@@ -30,13 +30,27 @@ import (
 )
 
 type ManifestStore interface {
-	Get(repo string, target string) (*manifest, error)
-	ManifestsForRepository(repo string) (map[string]manifest, bool)
-	Put(repo string, target string, m manifest) error
+	Get(repo string, target string) (*Manifest, error)
+	ManifestsForRepository(repo string) ([]Manifest, bool)
+	Put(m Manifest) error
 	Delete(repo string, target string) error
 	GetTags(repo string) ([]string, error)
 	Exists(repo string, target string) bool
 	ListRepositories() []string
+}
+
+type Manifest struct {
+	Repository string
+	Target     string
+	MediaType  string
+	Blob       []byte
+}
+
+func ConvertManifest(m Manifest) manifest {
+	return manifest{
+		contentType: m.MediaType,
+		blob:        m.Blob,
+	}
 }
 
 type catalog struct {
@@ -116,12 +130,12 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 			}
 		}
 
-		h, _, _ := v1.SHA256(bytes.NewReader(m.blob))
+		h, _, _ := v1.SHA256(bytes.NewReader(m.Blob))
 		resp.Header().Set("Docker-Content-Digest", h.String())
-		resp.Header().Set("Content-Type", m.contentType)
-		resp.Header().Set("Content-Length", fmt.Sprint(len(m.blob)))
+		resp.Header().Set("Content-Type", m.MediaType)
+		resp.Header().Set("Content-Length", fmt.Sprint(len(m.Blob)))
 		resp.WriteHeader(http.StatusOK)
-		io.Copy(resp, bytes.NewReader(m.blob))
+		io.Copy(resp, bytes.NewReader(m.Blob))
 		return nil
 
 	case http.MethodHead:
@@ -133,10 +147,10 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 				Message: "Unknown name",
 			}
 		} else {
-			h, _, _ := v1.SHA256(bytes.NewReader(m.blob))
+			h, _, _ := v1.SHA256(bytes.NewReader(m.Blob))
 			resp.Header().Set("Docker-Content-Digest", h.String())
-			resp.Header().Set("Content-Type", m.contentType)
-			resp.Header().Set("Content-Length", fmt.Sprint(len(m.blob)))
+			resp.Header().Set("Content-Type", m.MediaType)
+			resp.Header().Set("Content-Length", fmt.Sprint(len(m.Blob)))
 			resp.WriteHeader(http.StatusOK)
 			return nil
 		}
@@ -190,8 +204,16 @@ func (m *manifests) handle(resp http.ResponseWriter, req *http.Request) *regErro
 		}
 
 		// Store by digest and tag.
-		m.store.Put(repo, digest, mf)
-		m.store.Put(repo, target, mf)
+		manifest := Manifest{
+			Repository: repo,
+			Target:     target,
+			MediaType:  mf.contentType,
+			Blob:       mf.blob,
+		}
+		m.store.Put(manifest)
+
+		manifest.Target = digest
+		m.store.Put(manifest)
 
 		resp.Header().Set("Docker-Content-Digest", digest)
 		resp.WriteHeader(http.StatusCreated)
@@ -360,7 +382,7 @@ func (m *manifests) handleReferrers(resp http.ResponseWriter, req *http.Request)
 		}
 	}
 
-	digestToManifestMap, repoExists := m.store.ManifestsForRepository(repo)
+	manifests, repoExists := m.store.ManifestsForRepository(repo)
 	if !repoExists {
 		return &regError{
 			Status:  http.StatusNotFound,
@@ -374,7 +396,9 @@ func (m *manifests) handleReferrers(resp http.ResponseWriter, req *http.Request)
 		MediaType:     types.OCIImageIndex,
 		Manifests:     []v1.Descriptor{},
 	}
-	for digest, manifest := range digestToManifestMap {
+
+	for _, manifest := range manifests {
+		digest := manifest.Target
 		h, err := v1.NewHash(digest)
 		if err != nil {
 			continue
@@ -382,7 +406,7 @@ func (m *manifests) handleReferrers(resp http.ResponseWriter, req *http.Request)
 		var refPointer struct {
 			Subject *v1.Descriptor `json:"subject"`
 		}
-		json.Unmarshal(manifest.blob, &refPointer)
+		json.Unmarshal(manifest.Blob, &refPointer)
 		if refPointer.Subject == nil {
 			continue
 		}
@@ -396,10 +420,10 @@ func (m *manifests) handleReferrers(resp http.ResponseWriter, req *http.Request)
 				MediaType string `json:"mediaType"`
 			} `json:"config"`
 		}
-		json.Unmarshal(manifest.blob, &imageAsArtifact)
+		json.Unmarshal(manifest.Blob, &imageAsArtifact)
 		im.Manifests = append(im.Manifests, v1.Descriptor{
-			MediaType:    types.MediaType(manifest.contentType),
-			Size:         int64(len(manifest.blob)),
+			MediaType:    types.MediaType(manifest.MediaType),
+			Size:         int64(len(manifest.Blob)),
 			Digest:       h,
 			ArtifactType: imageAsArtifact.Config.MediaType,
 		})

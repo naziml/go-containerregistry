@@ -10,17 +10,17 @@ type ManifestMemoryStore struct {
 	ManifestStore
 	lock      sync.RWMutex
 	log       *log.Logger
-	manifests map[string]map[string]manifest
+	manifests map[string]map[string]Manifest
 }
 
 func NewInMemoryManifestStore(log *log.Logger) *ManifestMemoryStore {
 	return &ManifestMemoryStore{
 		log:       log,
-		manifests: make(map[string]map[string]manifest, 10),
+		manifests: make(map[string]map[string]Manifest, 10),
 	}
 }
 
-func (m *ManifestMemoryStore) Get(repo string, target string) (*manifest, error) {
+func (m *ManifestMemoryStore) Get(repo string, target string) (*Manifest, error) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
@@ -34,12 +34,15 @@ func (m *ManifestMemoryStore) Get(repo string, target string) (*manifest, error)
 	return nil, fmt.Errorf("repo not found")
 }
 
-func (m *ManifestMemoryStore) Put(repo string, target string, mf manifest) error {
+func (m *ManifestMemoryStore) Put(mf Manifest) error {
 	m.lock.Lock()
 	defer m.lock.Unlock()
 
+	repo := mf.Repository
+	target := mf.Target
+
 	if _, ok := m.manifests[repo]; !ok {
-		m.manifests[repo] = make(map[string]manifest, 2)
+		m.manifests[repo] = make(map[string]Manifest, 2)
 	}
 
 	// Allow future references by target (tag) and immutable digest.
@@ -95,12 +98,18 @@ func (m *ManifestMemoryStore) ListRepositories() []string {
 	return repos
 }
 
-func (m *ManifestMemoryStore) ManifestsForRepository(repo string) (map[string]manifest, bool) {
+func (m *ManifestMemoryStore) ManifestsForRepository(repo string) ([]Manifest, bool) {
 	m.lock.RLock()
 	defer m.lock.RUnlock()
 
-	if manifest, ok := m.manifests[repo]; ok {
-		return manifest, true
+	if manifests, ok := m.manifests[repo]; ok {
+		result := make([]Manifest, 0)
+
+		for _, mf := range manifests {
+			result = append(result, mf)
+		}
+
+		return result, true
 	} else {
 		return nil, false
 	}

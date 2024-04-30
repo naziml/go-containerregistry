@@ -30,16 +30,18 @@ var port = flag.Int("port", 1338, "port to run registry on")
 func main() {
 	flag.Parse()
 
-	listener, err := net.Listen("tcp", fmt.Sprintf("localhost:%d", *port))
+	listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *port))
 	if err != nil {
 		log.Fatal(err)
 	}
 	porti := listener.Addr().(*net.TCPAddr).Port
 	log.Printf("serving on port %d", porti)
+	manifestStore, _ := registry.NewSQLiteManifestStore("manifests.sqlite3")
 	s := &http.Server{
 		ReadHeaderTimeout: 5 * time.Second, // prevent slowloris, quiet linter
 		Handler: registry.New(
 			registry.WithWarning(.01, "Congratulations! You've won a lifetime's supply of free image pulls from this in-memory registry!"),
+			registry.WithManifestStore(manifestStore),
 		),
 	}
 	log.Fatal(s.Serve(listener))
