@@ -11,3 +11,4 @@ cmd/krane/krane
 **/*.sqlite3
 **/*.sqlite
 cmd/registry/registry
+.DS_Store
